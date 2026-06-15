@@ -17,6 +17,10 @@ from omnigent.harness_aliases import canonicalize_harness, is_native_harness
         # Canonical names pass through unchanged.
         ("openai-agents", "openai-agents"),
         ("pi", "pi"),
+        # Antigravity SDK harness: user-facing spellings → canonical id.
+        ("agy", "antigravity"),
+        ("google-antigravity", "antigravity"),
+        ("antigravity", "antigravity"),
         # Unknown names return unchanged so callers keep their own errors.
         ("bogus", "bogus"),
         (None, None),

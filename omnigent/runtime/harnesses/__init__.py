@@ -57,6 +57,12 @@ _HARNESS_MODULES: dict[str, str] = {
     # the underlying SDK package is ``openai-agents`` and the
     # executor class is :class:`OpenAIAgentsSDKExecutor`.
     "openai-agents": "omnigent.inner.openai_agents_sdk_harness",
+    # Google Antigravity SDK harness wrap. See
+    # omnigent/inner/antigravity_harness.py. Pure-Python SDK harness
+    # (``google-antigravity``), like openai-agents — no CLI binary, no
+    # sandbox subprocess. Drives Gemini 3 Pro by default (also Claude /
+    # GPT-OSS), with API-key / OpenAI-compatible-gateway / Databricks auth.
+    "antigravity": "omnigent.inner.antigravity_harness",
     # Supervisor harness wrap. See
     # omnigent/inner/databricks_supervisor_harness.py. Drives the Databricks
     # Agent Bricks Supervisor API at

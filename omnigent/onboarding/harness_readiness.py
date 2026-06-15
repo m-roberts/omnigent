@@ -37,7 +37,9 @@ from omnigent.onboarding.provider_config import (
 # the canonical ``openai-agents`` and the ``openai-agents-sdk`` spelling the
 # workflow's ``AgentHarnessType`` uses; executor-type spellings (``claude_sdk``
 # / ``agents_sdk``) and the ``claude`` alias normalize onto these first.
-_SDK_HARNESSES: frozenset[str] = frozenset({"claude-sdk", "openai-agents", "openai-agents-sdk"})
+_SDK_HARNESSES: frozenset[str] = frozenset(
+    {"claude-sdk", "openai-agents", "openai-agents-sdk", "antigravity"}
+)
 
 
 def _canonical_harness(harness: str) -> str:

@@ -49,7 +49,7 @@ resolved from the YAML file's directory.
 
 ```yaml
 executor:
-  harness: claude-sdk        # claude-sdk, openai-agents, codex, etc.
+  harness: claude-sdk        # claude-sdk, openai-agents, codex, pi, antigravity, ...
   model: databricks-claude-opus-4-7
   auth:
     type: databricks
@@ -58,6 +58,29 @@ executor:
 
 Set the Databricks profile under `executor.auth`. The older top-level
 `executor.profile` shorthand is legacy and should not be used in new specs.
+
+### Antigravity (Gemini)
+
+`harness: antigravity` runs the agent through Google's
+[Antigravity SDK](https://pypi.org/project/google-antigravity/)
+(`pip install "omnigent[antigravity]"`). It defaults to **Gemini 3 Pro**
+and can also drive Claude / GPT-OSS. Authenticate with an Antigravity /
+Gemini API key, or — like the other SDK harnesses — route through an
+OpenAI-compatible gateway (OpenRouter / LiteLLM) or a Databricks profile.
+
+```yaml
+executor:
+  harness: antigravity         # aliases: agy, google-antigravity
+  model: gemini-3-pro
+  auth:
+    type: api_key
+    api_key: ${GEMINI_API_KEY}     # or ANTIGRAVITY_API_KEY
+```
+
+To route through OpenRouter / a gateway, declare a key/gateway provider in
+`~/.omnigent/config.yaml` and reference it (`auth: {type: provider, name: …}`),
+or set `auth.base_url` to the OpenAI-compatible endpoint alongside the key.
+For Databricks, use `auth: {type: databricks, profile: …}`.
 
 CLI flags such as `--harness` and `--model` can override or supply missing
 executor values for a run. Databricks credentials come from the spec's

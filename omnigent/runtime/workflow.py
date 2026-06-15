@@ -139,7 +139,7 @@ _logger = logging.getLogger(__name__)
 # (hyphen), e.g. ``"claude_sdk"`` → ``"claude-sdk"`` used by ``_HARNESS_MODULES``.
 
 
-AgentHarnessType = Literal["claude-sdk", "codex", "pi", "openai-agents-sdk"]
+AgentHarnessType = Literal["claude-sdk", "codex", "pi", "openai-agents-sdk", "antigravity"]
 
 
 @dataclass(frozen=True)
@@ -221,6 +221,19 @@ _UCODE_HARNESS_CONFIGS: dict[AgentHarnessType, UcodeHarnessConfig] = {
         base_urls_key=None,
         host_key="HARNESS_OPENAI_AGENTS_GATEWAY_HOST",
         auth_key="HARNESS_OPENAI_AGENTS_GATEWAY_AUTH_COMMAND",
+        refresh_key=None,
+    ),
+    # Antigravity routes Databricks / gateway traffic over the OpenAI-
+    # compatible wire (same family as openai-agents-sdk), so it reuses the
+    # ucode "codex" agent entry for gateway URL / auth-command lookup.
+    "antigravity": UcodeHarnessConfig(
+        agent_name="codex",
+        model_key="HARNESS_ANTIGRAVITY_MODEL",
+        base_url_key="HARNESS_ANTIGRAVITY_GATEWAY_BASE_URL",
+        base_url_family="codex",
+        base_urls_key=None,
+        host_key="HARNESS_ANTIGRAVITY_GATEWAY_HOST",
+        auth_key="HARNESS_ANTIGRAVITY_GATEWAY_AUTH_COMMAND",
         refresh_key=None,
     ),
 }
@@ -374,6 +387,10 @@ _PROVIDER_HARNESS_FAMILY: dict[AgentHarnessType, str] = {
     "claude-sdk": ANTHROPIC_FAMILY,
     "codex": OPENAI_FAMILY,
     "openai-agents-sdk": OPENAI_FAMILY,
+    # Antigravity is Gemini-native but routes generic-provider traffic over
+    # the OpenAI-compatible wire (OpenRouter / LiteLLM / Databricks gateway),
+    # so it consumes the ``openai`` family like openai-agents-sdk.
+    "antigravity": OPENAI_FAMILY,
 }
 
 # Maps harnesses that gate the vendor-neutral gateway transport on a
@@ -406,6 +423,7 @@ _HARNESS_DATABRICKS_PROFILE: dict[AgentHarnessType, str] = {
     "codex": "HARNESS_CODEX_DATABRICKS_PROFILE",
     "pi": "HARNESS_PI_DATABRICKS_PROFILE",
     "openai-agents-sdk": "HARNESS_OPENAI_AGENTS_DATABRICKS_PROFILE",
+    "antigravity": "HARNESS_ANTIGRAVITY_DATABRICKS_PROFILE",
 }
 
 
@@ -579,6 +597,8 @@ def configure_agent_harness_with_provider(
         )
     if harness_type == "openai-agents-sdk":
         _apply_provider_to_openai_agents(env, family)
+    elif harness_type == "antigravity":
+        _apply_provider_to_antigravity(env, family)
     else:
         _apply_provider_family(env, harness_type, family)
 
@@ -722,6 +742,48 @@ def _apply_provider_to_openai_agents(env: dict[str, str], family: FamilyConfig) 
     if family.wire_api is not None:
         env["HARNESS_OPENAI_AGENTS_USE_RESPONSES"] = (
             "true" if family.wire_api == RESPONSES_WIRE_API else "false"
+        )
+
+
+def _apply_provider_to_antigravity(env: dict[str, str], family: FamilyConfig) -> None:
+    """Apply a provider family to the antigravity harness.
+
+    Like the openai-agents-sdk executor, the Antigravity executor takes the
+    API key and base URL directly (no ``GATEWAY`` enable flag): a static key
+    uses ``HARNESS_ANTIGRAVITY_API_KEY``; a dynamic token command uses the
+    auth-command + host pair. This is the path that lets Antigravity route
+    through OpenRouter / LiteLLM / a Databricks gateway over the OpenAI-
+    compatible wire, exactly like the other SDK harnesses.
+
+    :param env: Mutable spawn-env dict, modified in place.
+    :param family: The resolved ``openai`` provider family.
+    :raises OmnigentError: If no model is resolvable (neither the spec nor
+        the family declares one and the catalog has no default).
+    """
+    env["HARNESS_ANTIGRAVITY_GATEWAY_BASE_URL"] = family.base_url
+    if family.api_key:
+        env["HARNESS_ANTIGRAVITY_API_KEY"] = family.api_key
+    else:
+        # Dynamic token command: the executor refreshes the bearer token from
+        # this command + host (Databricks token refresh).
+        env["HARNESS_ANTIGRAVITY_GATEWAY_AUTH_COMMAND"] = _provider_auth_command(family)
+        env["HARNESS_ANTIGRAVITY_GATEWAY_HOST"] = _origin_of(family.base_url)
+    # Model precedence: spec model > provider ``models.default`` > catalog
+    # family default > fail loud.
+    if "HARNESS_ANTIGRAVITY_MODEL" not in env and family.default_model:
+        env["HARNESS_ANTIGRAVITY_MODEL"] = family.default_model
+    if "HARNESS_ANTIGRAVITY_MODEL" not in env:
+        catalog_default = _catalog_default_model(OPENAI_FAMILY)
+        if catalog_default is not None:
+            env["HARNESS_ANTIGRAVITY_MODEL"] = catalog_default
+    if "HARNESS_ANTIGRAVITY_MODEL" not in env:
+        raise OmnigentError(
+            "No model resolved for the 'antigravity' harness on a generic provider: "
+            "the agent spec sets no model, the provider's 'openai' family has no "
+            "'models.default', and the bundled catalog has no default for it. "
+            "Set 'executor.model' in the agent YAML, or add a "
+            "'models: {default: ...}' to that provider family in ~/.omnigent/config.yaml.",
+            code=ErrorCode.INVALID_INPUT,
         )
 
 
@@ -1388,6 +1450,75 @@ def _build_openai_agents_sdk_spawn_env(spec: AgentSpec) -> dict[str, str]:
         ucode_profile,
         harness_type="openai-agents-sdk",
     )
+    return env
+
+
+def _build_antigravity_spawn_env(spec: AgentSpec) -> dict[str, str]:
+    """
+    Build the env-var dict the antigravity harness wrap reads.
+
+    Maps ``spec.executor`` fields → the ``HARNESS_ANTIGRAVITY_*`` env vars
+    defined in ``omnigent/inner/antigravity_harness.py``. Mirrors
+    :func:`_build_openai_agents_sdk_spawn_env`'s auth-precedence (generic
+    provider → ``spec.executor.auth`` → global config → legacy profile →
+    auto-Databricks), minus the OpenAI-only ``use_responses`` switch.
+
+    Auth resolution order (highest priority first):
+
+    1. A generic provider (``executor.auth: {type: provider, …}`` or the
+       per-family global default) — sets API key / base URL / model and
+       returns early (no Databricks ucode enrichment to do).
+    2. ``spec.executor.auth`` — an explicit ``api_key`` (→ direct
+       Antigravity / Gemini key, or an OpenAI-compatible gateway key when a
+       base URL is set) or a ``databricks`` profile.
+    3. Global config ``auth:`` — only when the spec declares no auth at all.
+    4. Legacy ``executor.config["profile"]`` / auto-Databricks for
+       ``databricks-`` model prefixes.
+
+    :param spec: The agent spec.
+    :returns: A dict of env-var overrides. May be empty when no auth is
+        configured and the model is not ``databricks-`` prefixed; the wrap
+        then falls back to the SDK's ambient ``GEMINI_API_KEY`` /
+        ``ANTIGRAVITY_API_KEY`` and its built-in default model.
+    """
+    env: dict[str, str] = {}
+    model = _resolve_spec_model(spec)
+    if model is not None:
+        env["HARNESS_ANTIGRAVITY_MODEL"] = model
+
+    provider = _resolve_provider_for_build(spec, harness_type="antigravity")
+    if provider is not None:
+        configure_agent_harness_with_provider(env, provider, harness_type="antigravity")
+        return env
+
+    spec_auth = spec.executor.auth
+    auth: ApiKeyAuth | DatabricksAuth | None = (
+        spec_auth if isinstance(spec_auth, (ApiKeyAuth, DatabricksAuth)) else None
+    )
+    _spec_has_legacy_profile = bool(spec.executor.profile or spec.executor.config.get("profile"))
+    if auth is None and not _spec_has_legacy_profile:
+        auth = _load_global_auth()
+
+    if isinstance(auth, ApiKeyAuth):
+        env["HARNESS_ANTIGRAVITY_API_KEY"] = auth.api_key
+        if auth.base_url:
+            env["HARNESS_ANTIGRAVITY_GATEWAY_BASE_URL"] = auth.base_url
+    elif isinstance(auth, DatabricksAuth):
+        env["HARNESS_ANTIGRAVITY_DATABRICKS_PROFILE"] = auth.profile
+    else:
+        profile = spec.executor.config.get("profile")
+        if not profile and model and model.startswith(("databricks-", "databricks/")):
+            profile = "DEFAULT"
+        if profile:
+            env["HARNESS_ANTIGRAVITY_DATABRICKS_PROFILE"] = str(profile)
+
+    ucode_profile: str | None = None
+    if isinstance(auth, DatabricksAuth):
+        ucode_profile = auth.profile
+    elif "HARNESS_ANTIGRAVITY_DATABRICKS_PROFILE" in env:
+        ucode_profile = env["HARNESS_ANTIGRAVITY_DATABRICKS_PROFILE"]
+
+    configure_agent_harness_with_ucode(env, ucode_profile, harness_type="antigravity")
     return env
 
 
