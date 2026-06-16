@@ -6298,6 +6298,24 @@ def create_runner_app(
             ``model``, and ``config`` keys.
         :param spec: The cached ``AgentSpec``, or ``None``.
         """
+        # Pi manages its own context window, token counting, and
+        # compaction internally.  Omnigent's generic compaction
+        # calls OpenAI directly (or whatever the generic client
+        # resolves to) which doesn't work for Ollama-backed models.
+        # Skip Omnigent compaction for Pi harness sessions and let
+        # Pi handle it natively.
+        if spec is not None:
+            harness = (
+                spec.executor.config.get("harness")
+                if spec.executor.config
+                else None
+            ) or spec.executor.type
+            if harness == "pi":
+                _logger.debug(
+                    "Skipping proactive compaction for conv=%s (harness=pi)",
+                    conv,
+                )
+                return
         from omnigent.runtime.compaction import (
             CompactionResult,
             compact,
