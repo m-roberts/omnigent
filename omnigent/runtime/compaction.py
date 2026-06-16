@@ -126,7 +126,53 @@ class _CompactionState:
     connection: dict[str, str] | None = None
     conversation_id: str | None = None
     post_compaction_tokens: int | None = None
+
     history_len_at_compaction: int | None = None
+
+
+# Vision-model images are priced by resolution (e.g. 512×512 tiles),
+# not by base64 payload size.  Naïvely JSON-serialising a data URI
+# and feeding it to tiktoken inflates the count by ~10–50× because
+# every base64 character becomes a token candidate.  Pi (earendil-
+# works/pi) sidesteps this by charging a flat 4 800 chars per image
+# block (≈ 1 200 tokens after its chars÷4 heuristic).  We adopt the
+# same flat-rate here so that proactive budget checks stay in the
+# right ballpark for vision-capable models.
+_ESTIMATED_IMAGE_CHARS = 4800
+# After tiktoken encodes the JSON envelope, the per-image overhead
+# ends up slightly higher than 1 200; we round up conservatively.
+_ESTIMATED_IMAGE_TOKENS = 1200
+
+
+def _replace_data_uris(obj: Any) -> tuple[Any, int]:
+    """Recursively replace data-URI base64 payloads with short placeholders.
+
+    Returns a deep copy of *obj* with every string matching
+    ``data:<mime>;base64,<payload>`` replaced by a 1-char placeholder,
+    plus the count of replacements made.
+    """
+    if isinstance(obj, dict):
+        new: dict[str, Any] = {}
+        count = 0
+        for k, v in obj.items():
+            replaced_v, c = _replace_data_uris(v)
+            new[k] = replaced_v
+            count += c
+        return new, count
+    elif isinstance(obj, list):
+        new_list: list[Any] = []
+        count = 0
+        for item in obj:
+            replaced_item, c = _replace_data_uris(item)
+            new_list.append(replaced_item)
+            count += c
+        return new_list, count
+    elif isinstance(obj, str) and obj.startswith("data:") and ";base64," in obj:
+        # Replace the massive base64 payload with a 1-char placeholder
+        # so tiktoken only counts the JSON envelope, not the payload.
+        return "x", 1
+    else:
+        return obj, 0
 
 
 def count_tokens(messages: list[dict[str, Any]], model: str) -> int:
@@ -153,8 +199,14 @@ def count_tokens(messages: list[dict[str, Any]], model: str) -> int:
     except KeyError:
         # Unknown model — fall back to the most common encoding.
         enc = tiktoken.get_encoding("cl100k_base")
-    text = json.dumps(messages, ensure_ascii=False)
-    return len(enc.encode(text))
+    # Vision-model images are priced by resolution, not base64 size.
+    # Strip data-URI payloads before JSON serialisation so tiktoken
+    # doesn't count every base64 character as a token candidate.
+    stripped_messages, image_count = _replace_data_uris(messages)
+    text = json.dumps(stripped_messages, ensure_ascii=False)
+    base_count = len(enc.encode(text))
+    # Add flat per-image overhead (Pi heuristic: 4800 chars ≈ 1200 tokens).
+    return base_count + image_count * _ESTIMATED_IMAGE_TOKENS
 
 
 def _find_recent_boundary(

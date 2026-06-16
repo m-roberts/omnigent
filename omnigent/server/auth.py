@@ -331,6 +331,9 @@ class UnifiedAuthProvider(AuthProvider):
     def _check_header(self, request: HTTPConnection) -> str | None:
         """Read the ``X-Forwarded-Email`` header and return the user ID.
 
+        Falls back to ``CF-Access-Authenticated-User-Email`` (set by
+        Cloudflare Access) when ``X-Forwarded-Email`` is absent.
+
         When the header is present, its value is used as the identity
         (reserved names like ``"local"`` are rejected). When absent,
         the request is rejected (``None`` → 401): a missing or
@@ -350,7 +353,7 @@ class UnifiedAuthProvider(AuthProvider):
             header is absent on a single-user local runtime; else
             ``None`` (→ 401).
         """
-        email = request.headers.get("X-Forwarded-Email")
+        email = request.headers.get("X-Forwarded-Email") or request.headers.get("CF-Access-Authenticated-User-Email")
         if email:
             if email in _RESERVED_USERS:
                 return None
