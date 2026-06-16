@@ -24,7 +24,9 @@ from omnigent.inner.executor import (
 from omnigent.inner.pi_executor import (
     PiExecutor,
     _build_models_json,
+    _build_ollama_models_json,
     _generate_extension_js,
+    _looks_like_ollama_model,
     _pi_provider_for_model,
     _PiRpcSession,
     _sanitize_schema,
@@ -1350,6 +1352,58 @@ def test_pi_tools_arg_skips_unnamed_entries() -> None:
         assert sorted(names_arg.split(",")) == ["good", "read"], (
             f"unnamed / non-string-named tools must be filtered; got {names_arg!r}"
         )
+    finally:
+        import shutil
+
+        shutil.rmtree(config.tmp_dir, ignore_errors=True)
+
+
+def test_ollama_creates_models_json_with_image_support() -> None:
+    """
+    When the resolved model looks like an Ollama tag (contains ':'),
+    the harness must write a ``models.json`` that explicitly declares
+    ``"input": ["text", "image"]`` so Pi does not strip images with
+    its ``downgradeUnsupportedImages`` check.
+    """
+    with patch("omnigent.inner.pi_executor._find_pi_cli", return_value="/usr/bin/pi"):
+        executor = PiExecutor(gateway=False)
+
+    config = executor._build_env_and_dir([], None, None, "kimi-k2.6:cloud")
+    try:
+        assert "PI_CODING_AGENT_DIR" in config.env
+        models_path = os.path.join(config.env["PI_CODING_AGENT_DIR"], "models.json")
+        assert os.path.exists(models_path)
+        with open(models_path) as f:
+            data = json.load(f)
+        assert "providers" in data
+        ollama_provider = data["providers"]["ollama"]
+        assert ollama_provider["api"] == "openai-completions"
+        assert ollama_provider["apiKey"] == "ollama"
+        assert ollama_provider["baseUrl"] == "http://127.0.0.1:11434/v1"
+        models = ollama_provider["models"]
+        assert any(
+            m.get("id") == "kimi-k2.6:cloud" and m.get("input") == ["text", "image"]
+            for m in models
+        )
+    finally:
+        import shutil
+
+        shutil.rmtree(config.tmp_dir, ignore_errors=True)
+
+
+def test_non_ollama_model_skips_ollama_models_json() -> None:
+    """
+    OpenRouter-style ids (contain '/') must not trigger the Ollama
+    ``models.json`` path, so Pi's own model resolution / auto-discovery
+    stays untouched for non-Ollama providers.
+    """
+    with patch("omnigent.inner.pi_executor._find_pi_cli", return_value="/usr/bin/pi"):
+        executor = PiExecutor(gateway=False)
+
+    config = executor._build_env_and_dir([], None, None, "moonshotai/kimi-k2.6")
+    try:
+        # PI_CODING_AGENT_DIR is only set when we generate a models.json.
+        assert "PI_CODING_AGENT_DIR" not in config.env
     finally:
         import shutil
 

@@ -694,6 +694,46 @@ def _pi_provider_for_model(model: str) -> str:
     return "databricks-completions"
 
 
+def _looks_like_ollama_model(model: str) -> bool:
+    """Heuristic: Ollama model tags contain ':' (e.g. 'kimi-k2.6:cloud')."""
+    return ":" in model and "/" not in model
+
+
+def _build_ollama_models_json(
+    model: str,
+    base_url: str = "http://127.0.0.1:11434/v1",
+) -> dict[str, Any]:  # type: ignore[explicit-any]
+    """Build a Pi ``models.json`` for a local Ollama model.
+
+    Pi's auto-detection from Ollama's ``/api/tags`` endpoint defaults
+    to ``"input": ["text"]`` because Ollama doesn't advertise vision
+    capabilities. This helper overrides that with an explicit provider
+    entry that declares image support.
+
+    :param model: The Ollama model id, e.g. ``"kimi-k2.6:cloud"``.
+    :param base_url: Ollama API base URL. Defaults to the standard
+        local endpoint.
+    :returns: Pi ``models.json`` contents.
+    """
+    return {
+        "providers": {
+            "ollama": {
+                "api": "openai-completions",
+                "apiKey": "ollama",
+                "baseUrl": base_url,
+                "models": [
+                    {
+                        "_launch": True,
+                        "contextWindow": 262144,
+                        "id": model,
+                        "input": ["text", "image"],
+                    }
+                ],
+            }
+        }
+    }
+
+
 async def _create_subprocess_exec(*args: Any, **kwargs: Any) -> asyncio.subprocess.Process:  # type: ignore[explicit-any]
     """
     Indirection point for ``asyncio.create_subprocess_exec``.
@@ -1696,6 +1736,12 @@ class PiExecutor(Executor):
                 self._base_urls_override,
                 model=model,
             )
+            models_path = os.path.join(tmp_dir, "models.json")
+            with open(models_path, "w") as f:
+                json.dump(models_json, f)
+            env["PI_CODING_AGENT_DIR"] = tmp_dir
+        elif model is not None and _looks_like_ollama_model(model):
+            models_json = _build_ollama_models_json(model)
             models_path = os.path.join(tmp_dir, "models.json")
             with open(models_path, "w") as f:
                 json.dump(models_json, f)
