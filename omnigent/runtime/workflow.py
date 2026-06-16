@@ -13,6 +13,7 @@ import shlex
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
+from urllib.parse import urlparse
 
 import yaml
 
@@ -794,6 +795,21 @@ def _apply_provider_to_pi(env: dict[str, str], entry: ProviderEntry) -> None:
     :raises OmnigentError: If no configured family's credentials resolve,
         or no model can be resolved for the chosen family.
     """
+    # Local Ollama providers talk Ollama's OpenAI-compatible endpoint, not a
+    # generic vendor gateway. Routing them through the gateway transport
+    # registers the run model under a ``databricks-completions`` provider
+    # without vision support, so uploaded images are silently dropped. Skip
+    # the gateway env vars for a local provider pointing at the Ollama port;
+    # PiExecutor will then take its local-Ollama branch and build a
+    # models.json that declares image input for the model.
+    if entry.kind == "local":
+        openai_family = _optional_provider_family(entry, OPENAI_FAMILY)
+        if openai_family is not None:
+            parsed = urlparse(openai_family.base_url)
+            if parsed.port == 11434 and parsed.hostname in ("localhost", "127.0.0.1"):
+                if "HARNESS_PI_MODEL" not in env and openai_family.default_model:
+                    env["HARNESS_PI_MODEL"] = openai_family.default_model
+                return
     anthropic = _optional_provider_family(entry, ANTHROPIC_FAMILY)
     openai = _optional_provider_family(entry, OPENAI_FAMILY)
     base_urls: dict[str, str] = {}

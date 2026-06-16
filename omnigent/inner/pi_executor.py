@@ -564,6 +564,14 @@ _PI_ENV_ALLOW_PREFIXES: tuple[str, ...] = (
     "LC_",
 )
 
+# Path to the Ollama web-search Pi extension if it is installed on
+# this host. When present, the Pi harness exposes its native
+# ``web_search`` and ``web_fetch`` tools directly.
+_OLLAMA_PI_WEB_SEARCH_EXT = os.path.expanduser(
+    "~/.pi/agent/npm/node_modules/@ollama/pi-web-search/index.ts"
+)
+_OLLAMA_PI_WEB_SEARCH_TOOLS = ("web_search", "web_fetch")
+
 # Exact-matched env var names allowed into the Pi subprocess: the
 # minimal set a POSIX CLI reasonably expects.
 _PI_ENV_ALLOW_EXACT: frozenset[str] = frozenset(
@@ -1135,6 +1143,22 @@ def _convert_blocks_to_pi_format(
                     "mimeType": mime_type,
                     "data": b64,
                 })
+    logger.warning(
+        "_convert_blocks_to_pi_format: %d blocks, %d text parts, %d images",
+        len(blocks),
+        len(texts),
+        len(images),
+    )
+    for idx, block in enumerate(blocks):
+        btype = block.get("type")
+        has_image_url = isinstance(block.get("image_url"), str) and block["image_url"].startswith("data:")
+        logger.warning(
+            "  block[%d] type=%s has_image_url=%s keys=%s",
+            idx,
+            btype,
+            has_image_url,
+            list(block.keys()),
+        )
     return "\n".join(texts), images
 
 
@@ -1781,6 +1805,11 @@ class PiExecutor(Executor):
             with open(fallback_path, "w") as f:
                 json.dump(retry_settings, f, indent=2)
 
+        # Collect tool names to allowlist with Pi's ``--tools`` flag.
+        # ``--no-tools`` (set in __init__) disables every tool by default,
+        # so every exposed tool must be named here.
+        tool_names: list[str] = []
+
         # Generate the Omnigent tool bridge extension if tools are available.
         if tools and tool_server_port is not None:
             if tool_server_token is None:
@@ -1791,30 +1820,35 @@ class PiExecutor(Executor):
             with open(ext_path, "w") as f:
                 f.write(_generate_extension_js(tool_server_port, tools, tool_server_token))
             extra_args.extend(["--extension", ext_path])
-            # Allowlist the bridged tool names. ``--no-tools`` (set in
-            # __init__) disables every tool by default in pi 0.68+;
-            # ``--tools`` adds specific names back. Without this pass
-            # the bridge extension's tools register but pi never
-            # exposes them to the LLM — symptom: model replies "I
-            # don't have a calculate tool available."
-            tool_names = [
+            # Allowlist the bridged tool names.
+            tool_names.extend(
                 name for name in (s.get("name") for s in tools) if isinstance(name, str) and name
-            ]
-            # Pi's ``formatSkillsForPrompt`` (system-prompt.js:33,112)
-            # gates skill-index injection on ``selectedTools`` including
-            # ``"read"``. Pi's native ``read`` is a local filesystem read
-            # that runs in-process and never traverses the bridged /mcp
-            # path — so enabling it lets the model see (and load) the skills
-            # we wired via ``--skill <path>``. As a native tool it would
-            # otherwise escape all guardrails, so the generated extension's
-            # ``tool_call`` hook routes it (and any other native tool) through
-            # an Omnigent TOOL_CALL policy verdict; see
-            # :func:`_generate_extension_js` and
-            # :meth:`PiExecutor._gate_native_tool`.
-            if self._skills_filter != "none":
-                tool_names.append("read")
-            if tool_names:
-                extra_args.extend(["--tools", ",".join(tool_names)])
+            )
+
+        # Pi's ``formatSkillsForPrompt`` (system-prompt.js:33,112)
+        # gates skill-index injection on ``selectedTools`` including
+        # ``"read"``. Pi's native ``read`` is a local filesystem read
+        # that runs in-process and never traverses the bridged /mcp
+        # path — so enabling it lets the model see (and load) the skills
+        # we wired via ``--skill <path>``. As a native tool it would
+        # otherwise escape all guardrails, so the generated extension's
+        # ``tool_call`` hook routes it (and any other native tool) through
+        # an Omnigent TOOL_CALL policy verdict; see
+        # :func:`_generate_extension_js` and
+        # :meth:`PiExecutor._gate_native_tool`.
+        if self._skills_filter != "none":
+            tool_names.append("read")
+
+        # If the Ollama pi-web-search extension is installed, expose its
+        # native ``web_search`` and ``web_fetch`` tools. They call the local
+        # Ollama instance directly from inside Pi, so they do not need
+        # the Omnigent tool bridge. This matches the standalone Pi harness
+        # behaviour on this host.
+        if os.path.exists(_OLLAMA_PI_WEB_SEARCH_EXT):
+            tool_names.extend(_OLLAMA_PI_WEB_SEARCH_TOOLS)
+
+        if tool_names:
+            extra_args.extend(["--tools", ",".join(tool_names)])
 
         return PiSubprocessConfig(env=env, tmp_dir=tmp_dir, extra_args=extra_args)
 
@@ -1930,8 +1964,13 @@ class PiExecutor(Executor):
         message: str
         images: list[dict[str, str]] = []
         if isinstance(prompt, list):
+            logger.warning(
+                "Pi run_turn: prompt is a list of %d blocks",
+                len(prompt),
+            )
             message, images = _convert_blocks_to_pi_format(prompt)
         else:
+            logger.warning("Pi run_turn: prompt is a string (%d chars)", len(prompt))
             message = prompt
         cmd_id = f"turn_{id(messages)}"
         try:
@@ -1942,8 +1981,16 @@ class PiExecutor(Executor):
             }
             if images:
                 cmd["images"] = images
+            logger.warning(
+                "Pi run_turn: sending prompt cmd_id=%s text_len=%d image_count=%d image_sizes=%s",
+                cmd_id,
+                len(message),
+                len(images),
+                [len(img.get("data", "")) for img in images] if images else [],
+            )
             await rpc.send_command(cmd)
         except Exception as exc:  # noqa: BLE001 — executor boundary surfaces prompt-send errors as ExecutorError
+            logger.warning("Pi run_turn: failed to send prompt: %s", exc)
             yield ExecutorError(message=f"Failed to send prompt to Pi: {exc}")
             return
 
