@@ -1062,6 +1062,42 @@ class SandboxedPiCli:
     sandboxed: bool
 
 
+def _convert_blocks_to_pi_format(
+    blocks: list[dict[str, Any]],
+) -> tuple[str, list[dict[str, str]]]:
+    """Convert Omnigent content blocks to Pi's RPC prompt format.
+
+    Pi's JSONL protocol expects ``{type: "prompt", message: "text",
+    images?: [{type: "image", mimeType, data}]}`` — images are a separate
+    array, not embedded inside ``message``.  This helper splits an
+    Omnigent block list into the text message and Pi ImageContent items.
+
+    :param blocks: Omnigent content blocks, e.g. ``[{type: "input_text",
+        text: "..."}, {type: "input_image", image_url: "data:..."}]``.
+    :returns: ``(message_text, images)`` where ``images`` is Pi's format.
+    """
+    texts: list[str] = []
+    images: list[dict[str, str]] = []
+    for block in blocks:
+        block_type = block.get("type")
+        if block_type == "input_text":
+            text = block.get("text", "")
+            if text:
+                texts.append(text)
+        elif block_type == "input_image":
+            image_url = block.get("image_url", "")
+            if image_url.startswith("data:") and ";base64," in image_url:
+                # data:image/png;base64,ABC123...
+                prefix, b64 = image_url.split(";base64,", 1)
+                mime_type = prefix.replace("data:", "")
+                images.append({
+                    "type": "image",
+                    "mimeType": mime_type,
+                    "data": b64,
+                })
+    return "\n".join(texts), images
+
+
 def _try_sandbox_pi(
     pi_path: str,
     os_env: OSEnvSpec | None,
@@ -1839,23 +1875,28 @@ class PiExecutor(Executor):
             state._has_sent_prompt = True
 
         # Send prompt command. Pi's JSONL protocol requires
-        # ``message`` to be a string. When the prompt carries
-        # multimodal content blocks, JSON-encode them so the
-        # LLM sees the image data URIs in its context.
+        # ``message`` to be a string.  When the prompt carries
+        # multimodal content blocks we extract text for ``message``
+        # and images for the ``images`` field so Pi's vision model
+        # can actually see them.  Previously we JSON-encoded the raw
+        # block list into ``message`` — the model received a wall of
+        # base64 as text and hallucinated.
         message: str
+        images: list[dict[str, str]] = []
         if isinstance(prompt, list):
-            message = json.dumps(prompt)
+            message, images = _convert_blocks_to_pi_format(prompt)
         else:
             message = prompt
         cmd_id = f"turn_{id(messages)}"
         try:
-            await rpc.send_command(
-                {
-                    "type": "prompt",
-                    "message": message,
-                    "id": cmd_id,
-                }
-            )
+            cmd: dict[str, Any] = {
+                "type": "prompt",
+                "message": message,
+                "id": cmd_id,
+            }
+            if images:
+                cmd["images"] = images
+            await rpc.send_command(cmd)
         except Exception as exc:  # noqa: BLE001 — executor boundary surfaces prompt-send errors as ExecutorError
             yield ExecutorError(message=f"Failed to send prompt to Pi: {exc}")
             return
