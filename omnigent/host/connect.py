@@ -1375,6 +1375,14 @@ class HostProcess:
         # on both the managed-token and Bearer paths.
         headers: dict[str, str] = {"Origin": OMNIGENT_INTERNAL_WS_ORIGIN}
 
+        # When the server sits behind Cloudflare Access, the web UI's
+        # session identity comes from the X-Forwarded-Email header. Inject
+        # the same header from env so loopback hosts register under the
+        # user's identity instead of the generic "local" owner.
+        host_identity = os.environ.get("OMNIGENT_HOST_IDENTITY")
+        if host_identity:
+            headers["X-Forwarded-Email"] = host_identity
+
         managed_token = os.environ.get(HOST_TOKEN_ENV_VAR)
         if managed_token:
             headers[MANAGED_HOST_TOKEN_HEADER] = managed_token
